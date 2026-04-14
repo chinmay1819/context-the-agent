@@ -4,8 +4,22 @@ Markdown-as-context tools for LangChain agents. No embeddings, no vector DB — 
 
 ## Install
 
+Install directly from GitHub (pin to a tag for reproducible builds):
+
 ```bash
-pip install context-the-agent
+pip install git+https://github.com/chinmay1819/context-the-agent.git@v0.1.0
+```
+
+Or track `main`:
+
+```bash
+pip install git+https://github.com/chinmay1819/context-the-agent.git
+```
+
+In a `requirements.txt`:
+
+```
+context-the-agent @ git+https://github.com/chinmay1819/context-the-agent.git@v0.1.0
 ```
 
 ## Usage
