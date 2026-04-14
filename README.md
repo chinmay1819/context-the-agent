@@ -21,11 +21,11 @@ You should reach for this package when:
 This package is deliberately small. Before adopting it, know what it does **not** do:
 
 - **No semantic search.** If a user asks about "login" and your file is titled "authentication", the match depends on whether the word "login" appears in the file's summary or body. There are no embeddings to bridge vocabulary gaps. Good summaries and good filenames matter a lot.
-- **No sub-document retrieval.** The unit of reading is a whole file (capped at 200 KB per `read_file` call). If your files are huge, break them up yourself.
-- **Index must fit in the prompt.** You embed `INDEX.md` into the system prompt verbatim. A few hundred bullets is fine. Tens of thousands is not — this is not a substitute for a vector DB at large scale.
-- **Freshness is manual.** `write_index` runs when you call it. It does not watch the filesystem. If you add a file and forget to re-ingest, the agent will not know it exists (though `glob_files` may still find it).
-- **Writes are unconditional.** With `writable=True`, `write_file` overwrites files without prompting. Keep the context directory under version control, and do not point it at anything you are not prepared to let the agent clobber.
-- **Latency cost.** Each tool call is an extra LLM round-trip. A question that needs to read three files takes three extra turns. Fine for a CLI or async workflow, a problem for a sub-second chatbot.
+- **No sub-document retrieval.** The unit of reading is a whole file (capped at 50 KB per file inside `retrieve`). If your files are huge, break them up yourself.
+- **Index must fit in the LLM prompt inside `retrieve`.** A few hundred bullets is fine. Tens of thousands is not — this is not a substitute for a vector DB at large scale.
+- **Nested LLM calls.** `retrieve` makes two LLM calls per invocation (pick files → synthesize answer). `ingest` makes one per new file. The outer agent loop is shorter, but per-call cost is higher than a naive primitive tool setup.
+- **Writes are unconditional.** `ingest` overwrites existing files at the same path without prompting. Keep the context directory under version control, and do not point it at anything you are not prepared to let the agent clobber.
+- **Freshness is automatic for agent-written files, manual for external edits.** `ingest` refreshes `INDEX.md` after every write. If you edit markdown in your own editor, re-run `write_index` to resync.
 - **LangChain-coupled.** The tools are `langchain_core.tools.BaseTool`. If you are on LlamaIndex, raw OpenAI function-calling, or a non-LangChain agent framework, this package is not a drop-in fit.
 
 If any of those are showstoppers for your use case, you probably want a real RAG stack (LlamaIndex, Haystack, a vector DB). If none of them are, you will likely find this is 5% of the code for 80% of the value.
@@ -54,48 +54,45 @@ context-the-agent @ git+https://github.com/chinmay1819/context-the-agent.git@v0.
 
 ```python
 from pathlib import Path
+from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
-from langgraph.prebuilt import create_react_agent
 
-from context_the_agent import build_tools, write_index, load_index_prompt
+from context_the_agent import build_tools
 
 docs = Path("./docs")
-
-write_index(docs)                              # generates docs/INDEX.md
-index = load_index_prompt(docs)                # read back for your system prompt
-
-tools = build_tools(docs)                      # 4 read-only tools
-# tools = build_tools(docs, writable=True)     # add write_file (5 tools total)
-
 llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-agent = create_react_agent(
+
+tools = build_tools(docs, llm=llm)             # -> [ingest, ingest_document, retrieve]
+agent = create_agent(
     llm,
     tools=tools,
-    prompt=f"You are a docs assistant. Knowledge index:\n{index}",
+    prompt="You are a docs assistant. Use `retrieve` to answer questions, `ingest` to save notes.",
 )
 
 result = agent.invoke({"messages": [("user", "What endpoints exist?")]})
 print(result["messages"][-1].content)
 ```
 
+`INDEX.md` is built automatically the first time `retrieve` is called on an un-indexed corpus (one LLM summary per file, cached). For large pre-existing corpora you can pre-warm it at startup with `write_index(docs, llm=llm)` so the first user question doesn't pay the bootstrap cost.
+
 ## Public API
 
 | Symbol | Purpose |
 | --- | --- |
-| `build_tools(root, *, writable=False)` | Returns LangChain `BaseTool` list: `read_file`, `glob_files`, `grep_content`, `search_headings` (+ `write_file` if `writable=True`). |
-| `build_index(root)` | Returns the rendered `INDEX.md` text (pure, no write). |
-| `write_index(root)` | Builds the index and writes `root/INDEX.md`. Returns the path. |
-| `load_index_prompt(root)` | Reads `root/INDEX.md` and returns its contents. |
+| `build_tools(root, llm)` | Returns a three-tool list: `ingest` (write markdown), `ingest_document` (convert PDF/DOCX/PPTX/etc. via MarkItDown + write), and `retrieve` (answer a question from the corpus — auto-builds `INDEX.md` on first use). |
+| `write_index(root, *, llm=None)` | Optional pre-warm / resync helper — explicitly rebuild `INDEX.md`. Call this after editing markdown files outside the agent. With `llm`, summaries come from the LLM (cached); without, an offline heuristic is used. |
 
 All filesystem operations are guarded against path-traversal — tool calls outside the context root return an `ERROR: ...` string rather than raising.
 
-## Ingestion format
+## How the tools work
 
-`write_index` walks `*.md` under `root` and renders a bullet per file. The summary for each file is:
-1. The `summary:` field from YAML frontmatter, if present.
-2. Otherwise, the first non-heading paragraph (truncated to 200 chars).
+**`ingest(filepath, filename, content)`** — writes the markdown file at `<root>/<filepath>/<filename>` (creating parent dirs as needed), then rebuilds `INDEX.md`. Summaries are generated by a single LLM call per file, cached by content hash in `<root>/.context_cache.json` so unchanged files are not re-summarized on later calls.
 
-Re-run `write_index` whenever the corpus changes.
+**`ingest_document(source_path, target_filepath="", target_filename="")`** — same as `ingest`, but takes a path to a non-markdown file (PDF, DOCX, PPTX, XLSX, HTML, image, etc.) and runs it through Microsoft's [MarkItDown](https://github.com/microsoft/markitdown) first. Local, free, no API keys — bundled as a core dependency. If `target_filename` is empty, it's derived from the source's stem (`report.pdf` → `report.md`).
+
+**`retrieve(query)`** — reads `INDEX.md`, asks the LLM which file paths are most relevant to the query, reads those files, and asks the LLM to synthesize a natural-language answer with `path.md` citations. Two LLM calls per retrieval. If the corpus has no relevant files, the tool says so plainly rather than inventing an answer.
+
+Commit `.context_cache.json` to version control if you want reproducible summaries across machines; otherwise add it to `.gitignore`.
 
 ## Example
 
