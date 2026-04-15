@@ -47,7 +47,7 @@ def build_demo_agent():
 
     llm = ChatOpenAI(model=model, temperature=0, api_key=api_key)
     tools = build_tools(context_dir, llm=llm)
-    return create_agent(llm, tools=tools, prompt=SYSTEM_PROMPT)
+    return create_agent(llm, tools=tools, system_prompt=SYSTEM_PROMPT)
 
 
 def _last_ai_text(result) -> str:

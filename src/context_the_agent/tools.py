@@ -10,31 +10,11 @@ from markitdown import MarkItDown
 from ._security import resolve_safe_path
 from .ingest import (
     INDEX_FILENAME,
-    _message_text,
     build_index,
     load_index,
 )
 
-MAX_FILES_PER_RETRIEVE = 8
 MAX_FILE_BYTES_PER_RETRIEVE = 50_000
-
-PICK_PROMPT = """You are helping answer a user's question by choosing which markdown files to open from a knowledge corpus.
-
-User query: {query}
-
-Index of available files (path — one-line summary):
-{index}
-
-List the file paths (exactly as they appear in the index, without backticks) that are most likely to contain the answer. One path per line. At most {max_files}. If no file looks relevant, output nothing. No explanations, no bullets."""
-
-ANSWER_PROMPT = """Answer the user's query using ONLY the markdown file contents below. Cite the file path in backticks (e.g. `api.md`) whenever you draw on a file. If the provided files do not answer the query, say so plainly — do not fall back on general knowledge.
-
-User query: {query}
-
-Files:
-{files}
-
-Answer:"""
 
 
 def build_tools(context_root: Path, llm: BaseChatModel) -> list[BaseTool]:
@@ -157,69 +137,77 @@ def build_tools(context_root: Path, llm: BaseChatModel) -> list[BaseTool]:
         return _save_markdown(target_filepath, filename, content, verb="converted")
 
     @tool
-    def retrieve(query: str) -> str:
-        """Answer a natural-language question using the markdown corpus.
+    def retrieve(paths: list[str]) -> str:
+        """Read one or more markdown files from the knowledge corpus.
 
-        Looks at ``INDEX.md``, asks the LLM which files are relevant,
-        reads them, and asks the LLM to synthesize a natural-language
-        answer with file-path citations.
+        REQUIRED USAGE FLOW — follow these steps in order every time you
+        need to answer a factual question from this corpus:
 
-        Prefer this tool over answering from prior knowledge whenever the
-        corpus could plausibly cover the topic.
+        Step 1 — Always call ``retrieve(paths=["INDEX.md"])`` FIRST on any
+        new question. ``INDEX.md`` is a one-line-per-file summary of every
+        markdown file in the corpus; it tells you which files exist and
+        what each one covers. Skipping this step is not allowed — you
+        cannot know what the corpus contains without reading the index.
+
+        Step 2 — Read the summaries in ``INDEX.md`` and pick the file
+        paths most likely to contain the answer. Copy the paths exactly
+        as they appear in the index.
+
+        Step 3 — Call ``retrieve(paths=[...])`` again with the picked
+        paths. You can pass multiple paths in one call to save round
+        trips (e.g. ``retrieve(paths=["api.md", "notes/auth.md"])``).
+
+        Step 4 — Write your answer using ONLY the file contents returned.
+        Cite file paths in backticks (e.g. `api.md`) whenever you draw on
+        a file. If none of the files answer the user's question, say so
+        plainly — do not fall back on prior knowledge, do not guess.
+
+        If the user's question shifts to a different topic mid-conversation,
+        or you have not consulted the index yet in this session, re-read
+        ``INDEX.md`` before answering.
 
         Args:
-            query: The user's question in plain English.
+            paths: Relative paths to markdown files under the context
+                root, e.g. ``["INDEX.md"]`` or
+                ``["api.md", "notes/auth.md"]``. Each path must end in
+                ``.md``. Paths that escape the root, don't exist, or fail
+                to read are reported as ``=== ERROR: ... ===`` sections
+                inline — other files in the same call still return
+                normally.
 
         Returns:
-            A synthesized answer string (with ``path.md`` citations in
-            backticks), a friendly "no relevant files" message, or a
-            string beginning with ``"ERROR: "`` if the LLM call fails.
-            If ``INDEX.md`` does not exist yet, it is built automatically
-            on first use.
+            The concatenated contents of the requested files, each
+            wrapped in a ``=== `rel/path.md` ===`` header. Files larger
+            than 50 KB are truncated with a ``[...truncated]`` marker.
+            Call with ``paths=["INDEX.md"]`` first if you have not yet
+            seen the corpus index.
         """
-        index_text = _ensure_index(root, llm)
+        _ensure_index(root, llm)
+        if not paths:
+            return "=== ERROR: no paths provided — pass at least one, e.g. ['INDEX.md'] ==="
 
-        pick_prompt = PICK_PROMPT.format(
-            query=query, index=index_text, max_files=MAX_FILES_PER_RETRIEVE
-        )
-        try:
-            picked_msg = llm.invoke(pick_prompt)
-        except Exception as e:
-            return f"ERROR: LLM call failed during file selection: {e}"
-        candidates = _parse_paths(_message_text(picked_msg), root)
-        if not candidates:
-            return (
-                "I could not find any relevant files in the corpus for that question."
-            )
-
-        file_blocks: list[str] = []
-        for rel in candidates[:MAX_FILES_PER_RETRIEVE]:
+        blocks: list[str] = []
+        for rel in paths:
+            if not rel.endswith(".md"):
+                blocks.append(f"=== ERROR: path must end in .md: {rel} ===")
+                continue
             try:
                 p = resolve_safe_path(rel, root)
-            except ValueError:
+            except ValueError as e:
+                blocks.append(f"=== ERROR: {e} ===")
                 continue
             if not p.is_file():
+                blocks.append(f"=== ERROR: not a file: {rel} ===")
                 continue
             try:
                 text = p.read_text(encoding="utf-8", errors="replace")
-            except OSError:
+            except OSError as e:
+                blocks.append(f"=== ERROR: could not read {rel}: {e} ===")
                 continue
             if len(text) > MAX_FILE_BYTES_PER_RETRIEVE:
                 text = text[:MAX_FILE_BYTES_PER_RETRIEVE] + "\n[...truncated]"
-            file_blocks.append(f"=== `{rel}` ===\n{text}")
-
-        if not file_blocks:
-            return "Picked files were unreadable or outside the context root."
-
-        answer_prompt = ANSWER_PROMPT.format(
-            query=query, files="\n\n".join(file_blocks)
-        )
-        try:
-            answer_msg = llm.invoke(answer_prompt)
-        except Exception as e:
-            return f"ERROR: LLM call failed during answer synthesis: {e}"
-        answer = _message_text(answer_msg).strip()
-        return answer or "(no answer produced)"
+            blocks.append(f"=== `{rel}` ===\n{text}")
+        return "\n\n".join(blocks)
 
     return [ingest, ingest_document, retrieve]
 
@@ -243,19 +231,3 @@ def _ensure_index(root: Path, llm: BaseChatModel) -> str:
         return text
 
 
-def _parse_paths(text: str, root: Path) -> list[str]:
-    """Pull file paths out of LLM output; drop anything that isn't a real .md file under root."""
-    paths: list[str] = []
-    seen: set[str] = set()
-    for raw in text.splitlines():
-        line = raw.strip().lstrip("-•*").strip().strip("`").strip()
-        if not line or line in seen:
-            continue
-        try:
-            p = resolve_safe_path(line, root)
-        except ValueError:
-            continue
-        if p.is_file() and p.suffix == ".md":
-            seen.add(line)
-            paths.append(line)
-    return paths

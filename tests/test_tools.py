@@ -90,105 +90,88 @@ def test_ingest_os_error_on_write(tmp_path: Path, monkeypatch) -> None:
     assert out.startswith("ERROR: could not write")
 
 
-def test_retrieve_auto_bootstraps_index(tmp_path: Path) -> None:
-    """retrieve should build INDEX.md on first call if missing."""
+def test_retrieve_reads_index(tmp_path: Path) -> None:
+    """retrieve(['INDEX.md']) on a fresh corpus bootstraps and returns the index."""
     (tmp_path / "api.md").write_text("# API\n\nPOST /jobs.\n")
 
-    def _respond(prompt: str) -> str:
-        # Summarize call (during auto-bootstrap)
-        if prompt.startswith("Summarize this markdown file"):
-            return "api summary"
-        # Pick call
-        if "choosing which markdown files" in prompt:
-            return "api.md"
-        # Answer call
-        return "POST /jobs (`api.md`)"
-
-    retrieve = _by_name(build_tools(tmp_path, llm=_ScriptedLLM(_respond)))["retrieve"]
-    out = retrieve.invoke({"query": "endpoints?"})
-    assert "POST /jobs" in out
-    assert (tmp_path / "INDEX.md").exists()
-
-
-def test_retrieve_empty_corpus_auto_bootstrap(tmp_path: Path) -> None:
-    """retrieve on an empty dir should bootstrap an empty index and report no matches."""
-    def _respond(prompt: str) -> str:
-        if "choosing which markdown files" in prompt:
-            return ""
-        return ""
-
-    retrieve = _by_name(build_tools(tmp_path, llm=_ScriptedLLM(_respond)))["retrieve"]
-    out = retrieve.invoke({"query": "anything"})
-    assert "could not find any relevant files" in out.lower()
-    assert (tmp_path / "INDEX.md").exists()
-
-
-def test_retrieve_no_relevant_files(tmp_path: Path) -> None:
-    (tmp_path / "a.md").write_text("# A\n\nAlpha.\n")
-    write_index(tmp_path)  # heuristic, no llm needed
-
-    # LLM returns empty pick -> "no relevant files" message.
-    def _respond(prompt: str) -> str:
-        if "User query:" in prompt and "Index of available files" in prompt:
-            return ""
-        return ""
-
-    retrieve = _by_name(build_tools(tmp_path, llm=_ScriptedLLM(_respond)))["retrieve"]
-    out = retrieve.invoke({"query": "tell me about zebras"})
-    assert "could not find any relevant files" in out.lower()
-
-
-def test_retrieve_happy_path(tmp_path: Path) -> None:
-    (tmp_path / "api.md").write_text("# API\n\nPOST /jobs creates a job.\n")
-    (tmp_path / "misc.md").write_text("# Misc\n\nUnrelated.\n")
-    write_index(tmp_path)
-
-    def _respond(prompt: str) -> str:
-        if "Answer the user's query" in prompt:
-            assert "POST /jobs" in prompt  # chosen file was included
-            return "The API exposes POST /jobs (`api.md`)."
-        if "choosing which markdown files" in prompt:
-            return "api.md\n"
-        return ""
-
-    llm = _ScriptedLLM(_respond)
-    retrieve = _by_name(build_tools(tmp_path, llm=llm))["retrieve"]
-    out = retrieve.invoke({"query": "what endpoints exist?"})
-    assert "POST /jobs" in out
+    retrieve = _by_name(build_tools(tmp_path, llm=_summary_llm()))["retrieve"]
+    out = retrieve.invoke({"paths": ["INDEX.md"]})
+    assert "=== `INDEX.md` ===" in out
     assert "`api.md`" in out
-    # Two LLM calls: pick, then synthesize.
-    assert len(llm.calls) == 2
+    assert (tmp_path / "INDEX.md").exists()
 
 
-def test_retrieve_strips_bullets_and_backticks_from_picks(tmp_path: Path) -> None:
-    (tmp_path / "x.md").write_text("# X\n\nContent.\n")
-    write_index(tmp_path)
+def test_retrieve_reads_multiple_files(tmp_path: Path) -> None:
+    (tmp_path / "api.md").write_text("# API\n\nPOST /jobs creates a job.\n")
+    (tmp_path / "auth.md").write_text("# Auth\n\nJWT tokens.\n")
 
-    def _respond(prompt: str) -> str:
-        if "Answer the user's query" in prompt:
-            return "answer"
-        return "- `x.md`\n* `nonexistent.md`\n"
-
-    retrieve = _by_name(build_tools(tmp_path, llm=_ScriptedLLM(_respond)))["retrieve"]
-    out = retrieve.invoke({"query": "x"})
-    assert out == "answer"
+    retrieve = _by_name(build_tools(tmp_path, llm=_summary_llm()))["retrieve"]
+    out = retrieve.invoke({"paths": ["api.md", "auth.md"]})
+    assert "=== `api.md` ===" in out
+    assert "POST /jobs" in out
+    assert "=== `auth.md` ===" in out
+    assert "JWT tokens" in out
 
 
-def test_retrieve_llm_failure_during_pick(tmp_path: Path) -> None:
+def test_retrieve_reports_bad_paths_inline(tmp_path: Path) -> None:
+    (tmp_path / "good.md").write_text("# Good\n")
+
+    retrieve = _by_name(build_tools(tmp_path, llm=_summary_llm()))["retrieve"]
+    out = retrieve.invoke(
+        {"paths": ["good.md", "missing.md", "../../etc/passwd.md", "bad.txt"]}
+    )
+    # Good file renders normally
+    assert "=== `good.md` ===" in out
+    # Missing file reported
+    assert "=== ERROR: not a file: missing.md ===" in out
+    # Traversal reported
+    assert "escapes context root" in out
+    # Non-markdown rejected
+    assert "path must end in .md: bad.txt" in out
+
+
+def test_retrieve_empty_paths(tmp_path: Path) -> None:
+    retrieve = _by_name(build_tools(tmp_path, llm=_summary_llm()))["retrieve"]
+    out = retrieve.invoke({"paths": []})
+    assert "no paths provided" in out
+    assert "INDEX.md" in out
+
+
+def test_retrieve_truncates_large_file(tmp_path: Path) -> None:
+    (tmp_path / "big.md").write_text("x" * 60_000)
+    retrieve = _by_name(build_tools(tmp_path, llm=_summary_llm()))["retrieve"]
+    out = retrieve.invoke({"paths": ["big.md"]})
+    assert "[...truncated]" in out
+
+
+def test_retrieve_read_os_error(tmp_path: Path, monkeypatch) -> None:
     (tmp_path / "a.md").write_text("# A\n")
-    write_index(tmp_path)
+    retrieve = _by_name(build_tools(tmp_path, llm=_summary_llm()))["retrieve"]
 
-    def _boom(prompt):
-        raise RuntimeError("API down")
+    real = Path.read_text
 
-    class _ExplodingLLM:
-        calls: list = []
-        def invoke(self, prompt):
-            raise RuntimeError("API down")
+    def _maybe(self, *a, **kw):
+        if self.name == "a.md":
+            raise OSError("permission denied")
+        return real(self, *a, **kw)
 
-    retrieve = _by_name(build_tools(tmp_path, llm=_ExplodingLLM()))["retrieve"]
-    out = retrieve.invoke({"query": "x"})
-    assert out.startswith("ERROR:") and "file selection" in out
+    monkeypatch.setattr(Path, "read_text", _maybe)
+    out = retrieve.invoke({"paths": ["a.md"]})
+    assert "could not read a.md" in out
+
+
+def test_retrieve_makes_no_llm_calls_on_read(tmp_path: Path) -> None:
+    """After INDEX.md exists, retrieve must not invoke the LLM."""
+    (tmp_path / "a.md").write_text("# A\n\nAlpha.\n")
+    llm = _summary_llm()
+    tools = _by_name(build_tools(tmp_path, llm=llm))
+    # Bootstrap (LLM used for per-file summary)
+    tools["retrieve"].invoke({"paths": ["INDEX.md"]})
+    calls_after_bootstrap = len(llm.calls)
+    # Subsequent reads should add zero LLM calls.
+    tools["retrieve"].invoke({"paths": ["a.md"]})
+    tools["retrieve"].invoke({"paths": ["INDEX.md", "a.md"]})
+    assert len(llm.calls) == calls_after_bootstrap
 
 
 class _FakeMarkItDown:
@@ -300,18 +283,3 @@ def test_ingest_document_empty_conversion(tmp_path: Path, monkeypatch) -> None:
     assert "empty markdown" in out
 
 
-def test_retrieve_llm_failure_during_synthesis(tmp_path: Path) -> None:
-    (tmp_path / "a.md").write_text("# A\n")
-    write_index(tmp_path)
-
-    calls = {"n": 0}
-
-    def _respond(prompt: str) -> str:
-        calls["n"] += 1
-        if calls["n"] == 1:
-            return "a.md"
-        raise RuntimeError("synth boom")
-
-    retrieve = _by_name(build_tools(tmp_path, llm=_ScriptedLLM(_respond)))["retrieve"]
-    out = retrieve.invoke({"query": "x"})
-    assert out.startswith("ERROR:") and "answer synthesis" in out
