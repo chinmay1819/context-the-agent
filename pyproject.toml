@@ -13,7 +13,7 @@ authors = [{ name = "Chinmay Deshpande", email = "chinmaydeshpande34@gmail.com" 
 dependencies = [
     "langchain-core>=1.0.0",
     "pydantic>=2.0",
-    "markitdown>=0.0.1",
+    "markitdown[pdf,docx,pptx,xlsx,outlook]>=0.1.0",
 ]
 
 [project.optional-dependencies]
