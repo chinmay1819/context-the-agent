@@ -62,18 +62,62 @@ from context_the_agent import build_tools
 docs = Path("./docs")
 llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
-tools = build_tools(docs, llm=llm)             # -> [ingest, ingest_document, retrieve]
+# Three tools: ingest (write markdown), ingest_document (convert PDF/DOCX/etc.
+# to markdown then write), retrieve (read markdown files).
+tools = build_tools(docs, llm=llm)
+
+# The retrieve tool's docstring teaches the agent the four-step read flow
+# (INDEX.md first, pick paths, read picked files, answer with citations), so
+# you don't need to repeat that in your system prompt — keep it minimal.
 agent = create_agent(
     llm,
     tools=tools,
-    prompt="You are a docs assistant. Use `retrieve` to answer questions, `ingest` to save notes.",
+    system_prompt="You are a knowledge agent. Use the provided tools to ingest "
+                  "new information and answer questions from the markdown corpus.",
 )
 
-result = agent.invoke({"messages": [("user", "What endpoints exist?")]})
-print(result["messages"][-1].content)
+# Save something
+agent.invoke({"messages": [
+    ("user", "Remember: our API exposes POST /jobs and GET /jobs/{id}. Save as api.md.")
+]})
+
+# Ask about it
+answer = agent.invoke({"messages": [("user", "What endpoints does the API expose?")]})
+print(answer["messages"][-1].content)
 ```
 
-`INDEX.md` is built automatically the first time `retrieve` is called on an un-indexed corpus (one LLM summary per file, cached). For large pre-existing corpora you can pre-warm it at startup with `write_index(docs, llm=llm)` so the first user question doesn't pay the bootstrap cost.
+A typical retrieve turn looks like this in the agent transcript — you can see exactly which files the agent opened (full auditability):
+
+```
+[tool-call] retrieve(paths=["INDEX.md"])
+[tool-call] retrieve(paths=["api.md"])
+← The API exposes POST /jobs (create) and GET /jobs/{id} (read), per `api.md`.
+```
+
+### Pre-existing corpus
+
+If you already have a folder of `.md` files, just point `build_tools` at it. `INDEX.md` is built automatically the first time `retrieve` is called (one LLM summary per file, cached by content hash in `.context_cache.json` so unchanged files are not re-summarized later).
+
+For large corpora, pre-warm the index at startup so the first user question doesn't pay the bootstrap cost:
+
+```python
+from context_the_agent import write_index
+write_index(docs, llm=llm)        # builds docs/INDEX.md upfront
+```
+
+Re-run `write_index` after editing markdown files outside the agent (the `ingest` tool refreshes `INDEX.md` automatically for files the agent itself writes).
+
+### Ingesting non-markdown documents
+
+PDFs, Word docs, PowerPoints, spreadsheets, and Outlook `.msg` files are converted to markdown via [MarkItDown](https://github.com/microsoft/markitdown) (bundled), then ingested:
+
+```
+> Save the PDF at /tmp/contract.pdf into the corpus as contract.md.
+
+[tool-call] ingest_document(source_path="/tmp/contract.pdf",
+                            target_filename="contract.md")
+[tool-result] converted 14823 bytes to contract.md and updated INDEX.md
+```
 
 ## Public API
 
